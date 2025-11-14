@@ -88,15 +88,18 @@ def format_ars(n: int | float) -> str:
     s = f"{n:,.0f}"
     return "AR$ " + s.replace(",", ".")
 
+def norm_phone(s: str) -> str:
+    return re.sub(r"\D+", "", str(s or ""))
+
 # =========================
 # DATA ACCESS (Supabase)
 # =========================
 # Tablas esperadas:
 # - servicios: id(uuid), tipo, zona, duracion_min, precio, unique(tipo,zona)
-# - clientes: cliente_id, nombre, whatsapp, email, notas
-# - turnos: turno_id, cliente_id, fecha, inicio, fin, tipo, zonas,
+# - clientes: cliente_id(uuid), nombre, whatsapp, email, notas
+# - turnos: turno_id, cliente_id(uuid), fecha, inicio, fin, tipo, zonas,
 #           duracion_total, estado, notas, recordatorio_enviado
-# - historial: id, cliente_id, nombre, fecha, evento, detalles
+# - historial: id, cliente_id(uuid), nombre, fecha, evento, detalles
 
 # --- SERVICIOS ---
 def db_get_servicios() -> pd.DataFrame:
@@ -111,7 +114,6 @@ def db_get_servicios() -> pd.DataFrame:
     return df
 
 def db_save_servicios(df: pd.DataFrame):
-    # Upsert completo por (tipo, zona)
     records = df.fillna("").to_dict(orient="records")
     for r in records:
         r["duracion_min"] = int(pd.to_numeric(r.get("duracion_min", 0)))
@@ -119,9 +121,6 @@ def db_save_servicios(df: pd.DataFrame):
         supabase.table("servicios").upsert(r, on_conflict="tipo,zona").execute()
 
 # --- CLIENTES ---
-def norm_phone(s: str) -> str:
-    return re.sub(r"\D+", "", str(s or ""))
-
 def db_get_clientes() -> pd.DataFrame:
     res = supabase.table("clientes").select("*").execute()
     df = pd.DataFrame(res.data or [])
@@ -133,18 +132,25 @@ def db_get_clientes() -> pd.DataFrame:
             df[c] = df[c].astype(str)
     return df
 
-def db_upsert_cliente(cliente_id: str, nombre: str, whatsapp: str, email: str, notas: str = ""):
-    cliente_id = norm_phone(cliente_id or whatsapp)
-    whatsapp = norm_phone(whatsapp or cliente_id)
+def db_upsert_cliente(cliente_id: str, nombre: str, whatsapp: str, email: str, notas: str = "") -> str:
+    """
+    Opción 2 — cliente_id es un UUID independiente del teléfono.
+    Si cliente_id viene vacío → genera uno nuevo.
+    Si cliente_id existe → actualiza ese registro.
+    """
+    cid = (cliente_id or "").strip()
+    if not cid:
+        cid = str(uuid.uuid4())
+
     rec = {
-        "cliente_id": cliente_id,
+        "cliente_id": cid,
         "nombre": (nombre or "").strip(),
-        "whatsapp": whatsapp,
+        "whatsapp": norm_phone(whatsapp),
         "email": (email or "").strip(),
         "notas": (notas or "").strip(),
     }
     supabase.table("clientes").upsert(rec, on_conflict="cliente_id").execute()
-    return cliente_id
+    return cid
 
 # --- TURNOS ---
 def db_get_turnos() -> pd.DataFrame:
@@ -558,7 +564,9 @@ if st.session_state["vista"] == "reserva":
             if not nombre.strip() or not whatsapp.strip() or not booking.get("slot_dt"):
                 st.warning("Completá nombre, WhatsApp y elegí un horario.")
             else:
-                cid = db_upsert_cliente(whatsapp, nombre, whatsapp, email)
+                # Opción 2: siempre crea un cliente nuevo con UUID
+                cid = db_upsert_cliente("", nombre, whatsapp, email)
+
                 inicio_str = booking["slot_dt"].strftime("%H:%M")
                 fin_str = (booking["slot_dt"] + timedelta(minutes=booking["duracion"])).strftime("%H:%M")
                 turno_id = str(uuid.uuid4())
@@ -684,7 +692,7 @@ if st.session_state["vista"] == "admin":
             base_edit = base_turnos.copy()
             base_edit["fecha"] = base_edit["fecha"].astype(str)
 
-            # NUEVO: columna Cliente (Nombre – email) para que sea más legible
+            # Columna Cliente (Nombre – email) para que sea más legible
             if not clientes_df.empty:
                 cliente_map = clientes_df.set_index("cliente_id").apply(
                     lambda r: get_cliente_display_row(r),
@@ -737,7 +745,7 @@ if st.session_state["vista"] == "admin":
         st.divider()
         st.markdown("### ✅ Finalizar turno y archivar")
 
-        # NUEVO: solo muestra turnos que YA fueron marcados como "Realizado"
+        # Solo muestra turnos que YA fueron marcados como "Realizado"
         pendientes = turnos_df[turnos_df["estado"] == "Realizado"]
         if pendientes.empty:
             st.info("No hay turnos con estado 'Realizado' para archivar.")
@@ -759,15 +767,15 @@ if st.session_state["vista"] == "admin":
             colA, colB = st.columns([2, 2])
             is_new = colB.checkbox("Cliente nuevo")
 
-            if is_new:
-                n1, n2 = st.columns(2)
-                nuevo_nombre = n1.text_input("Nombre y apellido *")
-                nuevo_whats = n2.text_input("WhatsApp (+549...) *")
-                nuevo_email = st.text_input("Email")
+            if clientes_df.empty and not is_new:
+                st.warning("No hay clientes cargados. Marcá 'Cliente nuevo'.")
+                nuevo_nombre = nuevo_whats = nuevo_email = ""
             else:
-                if clientes_df.empty:
-                    st.warning("No hay clientes cargados. Marcá 'Cliente nuevo'.")
-                    nuevo_nombre = nuevo_whats = nuevo_email = ""
+                if is_new:
+                    n1, n2 = st.columns(2)
+                    nuevo_nombre = n1.text_input("Nombre y apellido *")
+                    nuevo_whats = n2.text_input("WhatsApp (+549...) *")
+                    nuevo_email = st.text_input("Email")
                 else:
                     cliente_ids = clientes_df["cliente_id"].astype(str).tolist()
 
@@ -778,65 +786,61 @@ if st.session_state["vista"] == "admin":
                     sel_cliente_id = st.selectbox("Cliente existente", cliente_ids, format_func=fmt_cliente)
                     row_sel = clientes_df[clientes_df["cliente_id"] == sel_cliente_id].iloc[0]
                     nuevo_nombre = str(row_sel.get("nombre", "") or "")
-                    nuevo_whats = str(row_sel.get("cliente_id", "") or "")
+                    nuevo_whats = str(row_sel.get("whatsapp", "") or "")
                     nuevo_email = str(row_sel.get("email", "") or "")
 
             notas_adic = st.text_area("Notas adicionales para el archivo (opcional)")
 
             if st.button("Finalizar y archivar", type="primary"):
-                if is_new and (not nuevo_nombre.strip() or not nuevo_whats.strip()):
-                    st.error("Completá nombre y WhatsApp para crear cliente nuevo.")
+                # Traemos el turno seleccionado
+                turnos = db_get_turnos()
+                ix = turnos.index[turnos["turno_id"] == sel_turno_id].tolist()
+                if not ix:
+                    st.error("No se encontró el turno.")
                 else:
-                    # Alta cliente si corresponde
+                    row_turno = turnos.loc[ix[0]]
+
                     if is_new:
-                        db_upsert_cliente(
-                            nuevo_whats.strip(),
-                            nuevo_nombre.strip(),
-                            nuevo_whats.strip(),
-                            nuevo_email.strip(),
-                        )
-
-                    # Buscar el turno ya Realizado
-                    turnos = db_get_turnos()
-                    ix = turnos.index[turnos["turno_id"] == sel_turno_id].tolist()
-                    if not ix:
-                        st.error("No se encontró el turno.")
-                    else:
-                        row_turno = turnos.loc[ix[0]]
-                        cid_final = norm_phone(nuevo_whats.strip() or str(row_turno["cliente_id"]))
-                        notas_previas = str(row_turno.get("notas", "") or "")
-                        if notas_adic.strip():
-                            notas_final = (notas_previas + " | " if notas_previas else "") + notas_adic.strip()
+                        if not nuevo_nombre.strip() or not nuevo_whats.strip():
+                            st.error("Completá nombre y WhatsApp para crear cliente nuevo.")
                         else:
-                            notas_final = notas_previas
+                            cid_final = db_upsert_cliente("", nuevo_nombre.strip(), nuevo_whats.strip(), nuevo_email.strip())
+                    else:
+                        cid_final = str(row_turno["cliente_id"])
 
-                        # Actualizamos notas + cliente_id (estado ya es Realizado)
-                        upd = {
-                            "cliente_id": cid_final,
-                            "notas": notas_final,
-                        }
-                        supabase.table("turnos").update(upd).eq("turno_id", sel_turno_id).execute()
+                    notas_previas = str(row_turno.get("notas", "") or "")
+                    if notas_adic.strip():
+                        notas_final = (notas_previas + " | " if notas_previas else "") + notas_adic.strip()
+                    else:
+                        notas_final = notas_previas
 
-                        # Historial global
-                        nombre_para_guardar = nuevo_nombre.strip()
-                        if not nombre_para_guardar and not clientes_df.empty and (
-                            cid_final in clientes_df["cliente_id"].values
-                        ):
-                            nombre_para_guardar = (
-                                clientes_df[clientes_df["cliente_id"] == cid_final]
-                                .iloc[0]
-                                .get("nombre", "")
-                            )
+                    # Actualizamos turno con cliente_id definitivo y notas
+                    upd = {
+                        "cliente_id": cid_final,
+                        "notas": notas_final,
+                    }
+                    supabase.table("turnos").update(upd).eq("turno_id", sel_turno_id).execute()
 
-                        detalles = (
-                            f"{row_turno.get('tipo', '')} | {row_turno.get('zonas', '')} | "
-                            f"{row_turno.get('fecha', '')} {row_turno.get('inicio', '')}-"
-                            f"{row_turno.get('fin', '')}"
+                    # Historial global
+                    nombre_para_guardar = nuevo_nombre.strip()
+                    if not nombre_para_guardar and not clientes_df.empty and (
+                        cid_final in clientes_df["cliente_id"].values
+                    ):
+                        nombre_para_guardar = (
+                            clientes_df[clientes_df["cliente_id"] == cid_final]
+                            .iloc[0]
+                            .get("nombre", "")
                         )
-                        db_add_historial(cid_final, nombre_para_guardar, "Turno finalizado", detalles)
 
-                        st.success("Turno archivado en historial ✅")
-                        st.rerun()
+                    detalles = (
+                        f"{row_turno.get('tipo', '')} | {row_turno.get('zonas', '')} | "
+                        f"{row_turno.get('fecha', '')} {row_turno.get('inicio', '')}-"
+                        f"{row_turno.get('fin', '')}"
+                    )
+                    db_add_historial(cid_final, nombre_para_guardar, "Turno finalizado", detalles)
+
+                    st.success("Turno archivado en historial ✅")
+                    st.rerun()
 
     # -------- 🧾 SERVICIOS
     with tab_servicios:
@@ -861,7 +865,7 @@ if st.session_state["vista"] == "admin":
     with tab_clientes:
         clientes_df = db_get_clientes()
         st.markdown("#### Base de clientes")
-        st.caption("Campos: cliente_id (WhatsApp), nombre, whatsapp, email, notas")
+        st.caption("Campos: cliente_id (UUID), nombre, whatsapp, email, notas")
         edit_cli = st.data_editor(
             clientes_df,
             num_rows="dynamic",
