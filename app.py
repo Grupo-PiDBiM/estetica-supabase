@@ -35,13 +35,15 @@ SLOT_STEP_MIN = 10
 BUFFER_MIN_DEFAULT = 5
 
 # Disponibilidad semanal (1=Lun ... 7=Dom)
+# ➜ Ahora: todos los días menos domingo (6 = sábado habilitado)
 DEFAULT_DISPONIBILIDAD_CODE = {
-    1: [("09:00", "13:00"), ("14:00", "17:00")],
-    2: [("09:00", "17:00")],
-    3: [("09:00", "17:00")],
-    4: [("09:00", "17:00")],
-    5: [("09:00", "15:00")],
-    # 6,7 sin turnos (sábado/domingo)
+    1: [("09:00", "13:00"), ("14:00", "17:00")],  # Lunes
+    2: [("09:00", "17:00")],                      # Martes
+    3: [("09:00", "17:00")],                      # Miércoles
+    4: [("09:00", "17:00")],                      # Jueves
+    5: [("09:00", "15:00")],                      # Viernes
+    6: [("09:00", "15:00")],                      # Sábado
+    # 7: sin turnos (Domingo)
 }
 
 # =========================
@@ -214,6 +216,10 @@ def calc_precio(servicios_df: pd.DataFrame, tipo: str, zonas: List[str]) -> int:
     return int(sel["precio"].sum()) if not sel.empty else 0
 
 def generar_slots(date_obj: date, dur_min: int, turnos_df: pd.DataFrame, slot_step_min: int = SLOT_STEP_MIN):
+    """
+    Genera slots disponibles para una fecha.
+    ➜ Cambio: cualquier turno que NO esté en 'Cancelado' bloquea su rango horario.
+    """
     if dur_min <= 0:
         return []
     weekday = date_obj.isoweekday()
@@ -223,10 +229,11 @@ def generar_slots(date_obj: date, dur_min: int, turnos_df: pd.DataFrame, slot_st
 
     activos = pd.DataFrame()
     if not turnos_df.empty:
-        # No bloquea Cancelado / No-show / Realizado
+        # Antes excluíamos Cancelado, No-show y Realizado.
+        # Ahora: solo los Cancelado liberan el horario.
         activos = turnos_df[
             (turnos_df["fecha"] == date_obj) &
-            (~turnos_df["estado"].isin(["Cancelado", "No-show", "Realizado"]))
+            (~turnos_df["estado"].isin(["Cancelado"]))
         ].copy()
 
     result = []
@@ -803,8 +810,8 @@ if st.session_state["vista"] == "admin":
                     if is_new:
                         if not nuevo_nombre.strip() or not nuevo_whats.strip():
                             st.error("Completá nombre y WhatsApp para crear cliente nuevo.")
-                        else:
-                            cid_final = db_upsert_cliente("", nuevo_nombre.strip(), nuevo_whats.strip(), nuevo_email.strip())
+                            st.stop()
+                        cid_final = db_upsert_cliente("", nuevo_nombre.strip(), nuevo_whats.strip(), nuevo_email.strip())
                     else:
                         cid_final = str(row_turno["cliente_id"])
 
@@ -812,7 +819,7 @@ if st.session_state["vista"] == "admin":
                     if notas_adic.strip():
                         notas_final = (notas_previas + " | " if notas_previas else "") + notas_adic.strip()
                     else:
-                        notas_final = notas_previas
+                        notas_final = notas_previvas = notas_previas
 
                     # Actualizamos turno con cliente_id definitivo y notas
                     upd = {
